@@ -7,18 +7,50 @@ import os
 import uuid
 import glob
 import re
+import time
+import asyncio
 from pathlib import Path
 from typing import List
 from processing import process_image, generate_preview, save_results_to_excel, generate_binary_mask_preview
 from typing import Optional
 from pydantic import BaseModel
 import json
+from contextlib import asynccontextmanager
+
+SESSION_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+CLEANUP_INTERVAL_SECONDS = 60 * 60  # run every 1 hour
+
+def cleanup_old_sessions():
+    """Delete session dirs in /tmp/uploads and /tmp/results not modified in >24h."""
+    now = time.time()
+    for base in [Path("/tmp/uploads"), Path("/tmp/results")]:
+        if not base.exists():
+            continue
+        for session_dir in base.iterdir():
+            if not session_dir.is_dir():
+                continue
+            age = now - session_dir.stat().st_mtime
+            if age > SESSION_TTL_SECONDS:
+                shutil.rmtree(session_dir, ignore_errors=True)
+                print(f"[cleanup] Removed old session: {session_dir}")
+
+async def periodic_cleanup():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        cleanup_old_sessions()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_old_sessions()  # clean on startup
+    task = asyncio.create_task(periodic_cleanup())
+    yield
+    task.cancel()
 
 class ExportRequest(BaseModel):
     image_id: str
     selected_ids: List[int]
 
-app = FastAPI(title="RodSizer")
+app = FastAPI(title="RodSizer", lifespan=lifespan)
 
 
 # Configure CORS
