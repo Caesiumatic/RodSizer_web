@@ -17,7 +17,7 @@ import json
 class ExportRequest(BaseModel):
     image_id: str
     selected_ids: List[int]
-    
+
 app = FastAPI(title="RodSizer")
 
 
@@ -30,16 +30,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directories
+# Base directories (session subdirs are created on demand)
 BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = Path("/tmp/uploads")
-RESULTS_DIR = Path("/tmp/results")
 FRONTEND_DIR = BASE_DIR / "frontend"
 RESULTS_SCHEMA_VERSION = 2
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
 FRONTEND_DIR.mkdir(exist_ok=True)
+
+
+def get_upload_dir(session_id: str) -> Path:
+    d = Path("/tmp/uploads") / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_results_dir(session_id: str) -> Path:
+    d = Path("/tmp/results") / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _cached_results_are_current(payload: dict, expected_binary_mask_tune: int = 0) -> bool:
@@ -63,8 +71,6 @@ def _sanitize_folder_name(folder_name: str) -> str:
     if folder_name is None:
         return ""
 
-    # Keep common punctuation users expect in folder names while blocking
-    # characters that are invalid or problematic across macOS and Windows.
     invalid_chars = '<>:"/\\|?*'
     cleaned = "".join(
         c for c in folder_name
@@ -76,8 +82,8 @@ def _sanitize_folder_name(folder_name: str) -> str:
     return cleaned
 
 
-def _find_input_and_calibration_source(image_id: str):
-    files = list(UPLOAD_DIR.rglob(f"{image_id}.*"))
+def _find_input_and_calibration_source(image_id: str, upload_dir: Path):
+    files = list(upload_dir.rglob(f"{image_id}.*"))
     if not files:
         raise HTTPException(status_code=404, detail="Image not found")
 
@@ -124,17 +130,17 @@ async def read_folder_analysis():
 # --- Folder Management ---
 
 @app.post("/folders")
-async def create_folder(folder_name: str = Form(...)):
+async def create_folder(folder_name: str = Form(...), session_id: str = Query(...)):
     try:
-        # Sanitize folder name (basic)
+        upload_dir = get_upload_dir(session_id)
         safe_name = _sanitize_folder_name(folder_name)
         if not safe_name:
              raise HTTPException(status_code=400, detail="Invalid folder name")
-        
-        folder_path = UPLOAD_DIR / safe_name
+
+        folder_path = upload_dir / safe_name
         if folder_path.exists():
              raise HTTPException(status_code=400, detail="Folder already exists")
-        
+
         folder_path.mkdir(parents=True, exist_ok=True)
         return {"status": "success", "folder": safe_name}
     except HTTPException:
@@ -143,13 +149,10 @@ async def create_folder(folder_name: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/folders")
-async def list_folders():
+async def list_folders(session_id: str = Query(...)):
+    upload_dir = get_upload_dir(session_id)
     folders = []
-    # Ensure root exists
-    if not UPLOAD_DIR.exists():
-        return []
-    
-    for path in UPLOAD_DIR.iterdir():
+    for path in upload_dir.iterdir():
         if path.is_dir():
             folders.append(path.name)
     folders.sort()
@@ -157,9 +160,10 @@ async def list_folders():
 
 
 @app.put("/folders/{folder_name}")
-async def rename_folder(folder_name: str, new_name: str = Form(...)):
+async def rename_folder(folder_name: str, new_name: str = Form(...), session_id: str = Query(...)):
     try:
-        source_path = UPLOAD_DIR / folder_name
+        upload_dir = get_upload_dir(session_id)
+        source_path = upload_dir / folder_name
         if not source_path.exists() or not source_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
 
@@ -170,7 +174,7 @@ async def rename_folder(folder_name: str, new_name: str = Form(...)):
         if safe_name == folder_name:
             return {"status": "success", "folder": safe_name, "renamed": False}
 
-        target_path = UPLOAD_DIR / safe_name
+        target_path = upload_dir / safe_name
         if target_path.exists():
             raise HTTPException(status_code=400, detail="A folder with that name already exists")
 
@@ -182,20 +186,14 @@ async def rename_folder(folder_name: str, new_name: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/folders/{folder_name}")
-async def delete_folder(folder_name: str):
+async def delete_folder(folder_name: str, session_id: str = Query(...)):
     try:
-        folder_path = UPLOAD_DIR / folder_name
+        upload_dir = get_upload_dir(session_id)
+        folder_path = upload_dir / folder_name
         if not folder_path.exists() or not folder_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
-        
-        # Delete folder and contents
+
         shutil.rmtree(folder_path)
-        
-        # Also clean up results for images that were in this folder?
-        # Since we don't strictly track which result belongs to which folder in the filename (only ID),
-        # this is tricky unless we scan the deleted files.
-        # For now, let's just delete the upload folder. Orphaned results are harmless but take space.
-        
         return {"status": "success", "message": "Folder deleted"}
     except HTTPException:
         raise
@@ -209,88 +207,82 @@ class FolderSelectionRequest(BaseModel):
     selected_ids: List[int]
 
 @app.post("/folders/{folder_name}/save_selection")
-async def save_folder_selection(folder_name: str, req: FolderSelectionRequest):
+async def save_folder_selection(folder_name: str, req: FolderSelectionRequest, session_id: str = Query(...)):
     try:
-        folder_path = UPLOAD_DIR / folder_name
+        upload_dir = get_upload_dir(session_id)
+        results_dir = get_results_dir(session_id)
+        folder_path = upload_dir / folder_name
         if not folder_path.exists():
             raise HTTPException(status_code=404, detail="Folder not found")
-            
-        # Analysis cache dir inside the folder (hidden)
+
         cache_dir = folder_path / ".analysis_cache"
         cache_dir.mkdir(exist_ok=True)
-        
-        # Load original full results
-        json_path = RESULTS_DIR / f"{req.image_id}_results.json"
+
+        json_path = results_dir / f"{req.image_id}_results.json"
         if not json_path.exists():
              raise HTTPException(status_code=404, detail="Original analysis not found")
-             
+
         with open(json_path) as f:
             data = json.load(f)
-            
-        # Filter
+
         full_results = data.get("data", [])
         filtered = [r for r in full_results if r["id"] in req.selected_ids]
-        
+
         if not filtered:
              raise HTTPException(status_code=400, detail="No particles selected to save")
-             
-        # Save payload
+
         save_payload = {
             "image_id": req.image_id,
             "filename": data.get("filename", req.image_id),
             "data": filtered,
-            "timestamp": data.get("timestamp", ""), # if available
+            "timestamp": data.get("timestamp", ""),
             "pixel_size_nm": data.get("pixel_size_nm", 0)
         }
-        
+
         output_path = cache_dir / f"{req.image_id}.json"
         with open(output_path, "w") as f:
             json.dump(save_payload, f, indent=2)
-            
+
         return {"status": "success", "count": len(filtered)}
-        
+
     except Exception as e:
         print(f"Save Selection Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/folders/{folder_name}/aggregate")
-async def aggregate_folder(folder_name: str):
+async def aggregate_folder(folder_name: str, session_id: str = Query(...)):
     try:
-        folder_path = UPLOAD_DIR / folder_name
+        upload_dir = get_upload_dir(session_id)
+        folder_path = upload_dir / folder_name
         cache_dir = folder_path / ".analysis_cache"
-        
+
         if not cache_dir.exists():
             return {"data": [], "stats": {}, "file_count": 0}
-            
+
         combined_data = []
         files = list(cache_dir.glob("*.json"))
-        
+
         for p in files:
             with open(p) as f:
                 payload = json.load(f)
                 fname = payload.get("filename", "unknown")
-                # Append source info to each particle
                 for p_data in payload.get("data", []):
                     p_data["source_image"] = fname
                     combined_data.append(p_data)
-                    
-        # Calculate Aggregated Stats
+
         stats = {}
         if combined_data:
-            # We can use pandas for quick stats if available or manual
-            # Let's use pandas since we used it in processing
             import pandas as pd
             df = pd.DataFrame(combined_data)
-            
-            # Helper
+
             def get_stat(col):
                 if col not in df: return 0
                 return round(float(df[col].mean()), 1), round(float(df[col].std()), 1)
-            
+
             l_m, l_s = get_stat("length_nm")
             w_m, w_s = get_stat("width_nm")
             ar_m, ar_s = get_stat("aspect_ratio")
-            
+
             stats = {
                 "count": len(combined_data),
                 "mean_length": f"{l_m} ± {l_s}",
@@ -309,37 +301,37 @@ async def aggregate_folder(folder_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/folders/{folder_name}/export_aggregate")
-async def export_aggregate_folder(folder_name: str):
+async def export_aggregate_folder(folder_name: str, session_id: str = Query(...)):
     try:
-        folder_path = UPLOAD_DIR / folder_name
+        upload_dir = get_upload_dir(session_id)
+        results_dir = get_results_dir(session_id)
+        folder_path = upload_dir / folder_name
         cache_dir = folder_path / ".analysis_cache"
-        
+
         if not cache_dir.exists():
             raise HTTPException(status_code=404, detail="No data to export")
-            
+
         combined_data = []
         files = list(cache_dir.glob("*.json"))
-        
+
         for p in files:
             with open(p) as f:
                 payload = json.load(f)
                 fname = payload.get("filename", "unknown")
-                # Append source info to each particle
                 for p_data in payload.get("data", []):
                     p_data["source_image"] = fname
                     combined_data.append(p_data)
-        
+
         if not combined_data:
             raise HTTPException(status_code=400, detail="No data found")
 
-        # Generate Temp Excel
         temp_name = f"export_folder_{folder_name}_{uuid.uuid4().hex[:8]}.xlsx"
-        temp_path = RESULTS_DIR / temp_name
-        
+        temp_path = results_dir / temp_name
+
         save_results_to_excel(combined_data, temp_path)
-        
+
         return FileResponse(
-            path=temp_path, 
+            path=temp_path,
             filename=f"{folder_name}_analysis_report.xlsx",
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
@@ -351,48 +343,45 @@ async def export_aggregate_folder(folder_name: str):
 # -------------------------
 
 @app.post("/upload")
-async def upload_images(background_tasks: BackgroundTasks, folder: str = Form(None), files: List[UploadFile] = File(...)):
+async def upload_images(background_tasks: BackgroundTasks, folder: str = Form(None), files: List[UploadFile] = File(...), session_id: str = Query(...)):
+    upload_dir = get_upload_dir(session_id)
+    results_dir = get_results_dir(session_id)
     uploaded_files = []
     try:
         for file in files:
             file_id = str(uuid.uuid4())
             safe_filename = Path(file.filename).name
             save_name = f"{file_id}_{safe_filename}"
-            
-            # Determine save directory
+
             if folder:
-                save_dir = UPLOAD_DIR / folder
+                save_dir = upload_dir / folder
                 if not save_dir.exists():
                     raise HTTPException(status_code=400, detail="Folder does not exist")
             else:
-                save_dir = UPLOAD_DIR
-                
+                save_dir = upload_dir
+
             file_path = save_dir / save_name
-            
+
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-            
-            # 1. Generate Immediate Preview (Sync)
-            # This ensures the user sees something right away
-            generate_preview(file_path, RESULTS_DIR)
-            
+
+            generate_preview(file_path, results_dir)
+
             uploaded_files.append({
-                "id": file_path.stem, 
+                "id": file_path.stem,
                 "filename": safe_filename,
                 "status": "processing"
             })
-            
-            # 2. Queue Heavy Processing (Background)
-            # Find matching calibration file (.dm3/.dm4)
+
             search_dir = file_path.parent
             calibration_source_path = None
             original_stem = None
-            
+
             if len(save_name) > 37 and save_name[36] == '_':
                 original_stem = Path(save_name[37:]).stem
             else:
                 original_stem = Path(save_name).stem
-                
+
             for f in search_dir.glob("*"):
                 if f.suffix.lower() in ['.dm3', '.dm4', '.emd']:
                     dm3_stem = None
@@ -403,64 +392,59 @@ async def upload_images(background_tasks: BackgroundTasks, folder: str = Form(No
                     if dm3_stem == original_stem:
                         calibration_source_path = f
                         break
-            
-            # Add to background tasks
-            background_tasks.add_task(process_image, file_path, RESULTS_DIR, None, calibration_source_path)
+
+            background_tasks.add_task(process_image, file_path, results_dir, None, calibration_source_path)
 
         return uploaded_files
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/images")
-async def list_images(folder: str = Query(None)):
+async def list_images(session_id: str = Query(...), folder: str = Query(None)):
+    upload_dir = get_upload_dir(session_id)
+    results_dir = get_results_dir(session_id)
     images = []
-    
-    target_dir = UPLOAD_DIR
+
+    target_dir = upload_dir
     if folder:
-        target_dir = UPLOAD_DIR / folder
+        target_dir = upload_dir / folder
         if not target_dir.exists():
-            return [] # Empty if folder doesn't exist
-            
+            return []
+
     for path in target_dir.glob("*"):
         if path.is_file() and path.suffix.lower() in ['.tif', '.tiff', '.jpg', '.jpeg', '.png', '.dm3', '.dm4', '.emd']:
-            # Try to extract original name if it follows UUID_Name pattern
             display_name = path.name
             if len(path.name) > 37 and path.name[36] == '_':
                 display_name = path.name[37:]
-            
-            # Check status
+
             image_id = path.stem
-            # If overlay exists, it's done
-            overlay_path = RESULTS_DIR / f"{image_id}_overlay.jpg"
+            overlay_path = results_dir / f"{image_id}_overlay.jpg"
             status = "complete" if overlay_path.exists() else "processing"
-            
+
             images.append({
-                "id": image_id, 
+                "id": image_id,
                 "filename": path.name,
                 "display_name": display_name,
                 "status": status
             })
-    # Sort by newest first (optional, but nice)
     images.sort(key=lambda x: x['display_name'])
     return images
 
 @app.delete("/images/{image_id}")
-async def delete_image(image_id: str):
+async def delete_image(image_id: str, session_id: str = Query(...)):
     try:
-        # Find file in uploads (recursive search)
-        files = list(UPLOAD_DIR.rglob(f"{image_id}.*"))
+        upload_dir = get_upload_dir(session_id)
+        results_dir = get_results_dir(session_id)
+        files = list(upload_dir.rglob(f"{image_id}.*"))
         if not files:
             raise HTTPException(status_code=404, detail="Image not found")
-        
-        # Delete source file
+
         for f in files:
             os.remove(f)
-            
-        # Delete results if they exist
-        # Result files usually start with image_id
-        for res_file in RESULTS_DIR.glob(f"{image_id}*"):
+
+        for res_file in results_dir.glob(f"{image_id}*"):
             os.remove(res_file)
-            
+
         return {"status": "success", "message": "Image deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -468,17 +452,19 @@ async def delete_image(image_id: str):
 @app.post("/process/{image_id}")
 async def process_image_endpoint(
     image_id: str,
+    session_id: str = Query(...),
     manual_pixel_size: float = None,
     requested_bar_length_nm: float = None,
     force_reprocess: bool = False,
     binary_mask_tune: int = 0
 ):
     try:
-        input_path, calibration_source_path = _find_input_and_calibration_source(image_id)
+        upload_dir = get_upload_dir(session_id)
+        results_dir = get_results_dir(session_id)
+        input_path, calibration_source_path = _find_input_and_calibration_source(image_id, upload_dir)
 
         if not manual_pixel_size and not force_reprocess:
-            # Check for existing results to avoid re-processing
-            results_path = RESULTS_DIR / f"{image_id}_results.json"
+            results_path = results_dir / f"{image_id}_results.json"
             if results_path.exists():
                 import json
                 try:
@@ -487,11 +473,11 @@ async def process_image_endpoint(
                     if _cached_results_are_current(cached, expected_binary_mask_tune=binary_mask_tune):
                         return cached
                 except Exception:
-                    pass # If corrupt, re-process
+                    pass
 
         result = process_image(
             input_path,
-            RESULTS_DIR,
+            results_dir,
             manual_pixel_size,
             calibration_source_path,
             requested_bar_length_nm,
@@ -506,14 +492,17 @@ async def process_image_endpoint(
 @app.post("/process/{image_id}/binary_preview")
 async def process_binary_preview_endpoint(
     image_id: str,
+    session_id: str = Query(...),
     manual_pixel_size: float = None,
     binary_mask_tune: int = 0
 ):
     try:
-        input_path, calibration_source_path = _find_input_and_calibration_source(image_id)
+        upload_dir = get_upload_dir(session_id)
+        results_dir = get_results_dir(session_id)
+        input_path, calibration_source_path = _find_input_and_calibration_source(image_id, upload_dir)
         return generate_binary_mask_preview(
             input_path,
-            RESULTS_DIR,
+            results_dir,
             manual_pixel_size,
             calibration_source_path,
             binary_mask_tune
@@ -522,15 +511,14 @@ async def process_binary_preview_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/results/{filename}")
-async def get_result_file(filename: str):
-    file_path = RESULTS_DIR / filename
+async def get_result_file(filename: str, session_id: str = Query(...)):
+    upload_dir = get_upload_dir(session_id)
+    results_dir = get_results_dir(session_id)
+    file_path = results_dir / filename
     if not file_path.exists():
-        # Try looking in uploads for original images if requested via this endpoint
-        # Check root
-        file_path = UPLOAD_DIR / filename
+        file_path = upload_dir / filename
         if not file_path.exists():
-            # Check recursively in uploads
-            found = list(UPLOAD_DIR.rglob(filename))
+            found = list(upload_dir.rglob(filename))
             if found:
                 file_path = found[0]
             else:
@@ -540,43 +528,31 @@ async def get_result_file(filename: str):
 # --- Export ---
 
 @app.post("/export")
-async def export_data(req: ExportRequest):
+async def export_data(req: ExportRequest, session_id: str = Query(...)):
     try:
-        # Load cache
-        json_path = RESULTS_DIR / f"{req.image_id}_results.json"
+        results_dir = get_results_dir(session_id)
+        json_path = results_dir / f"{req.image_id}_results.json"
         if not json_path.exists():
             raise HTTPException(status_code=404, detail="Results not found")
-            
+
         with open(json_path) as f:
             data = json.load(f)
-            
+
         full_results = data.get("data", [])
-        
-        # Filter Logic
-        # If selected_ids is empty, interpret as "None Selected" -> Empty file?
-        # Or strict adherence: Only export what is in list.
-        # Frontend ensures at least one is selected ideally, or we export empty.
-        
         filtered_results = [r for r in full_results if r["id"] in req.selected_ids]
-        
+
         if not filtered_results:
              raise HTTPException(status_code=400, detail="No particles selected")
 
-        # Generate Temp Excel
         temp_name = f"export_{req.image_id}_{uuid.uuid4().hex[:8]}.xlsx"
-        temp_path = RESULTS_DIR / temp_name
-        
+        temp_path = results_dir / temp_name
+
         save_results_to_excel(filtered_results, temp_path)
-        
-        # We should use BackgroundTasks to clean up, but simpler here:
-        # FileResponse can delete after? using background. 
-        # But allow it to persist is fine for now (results dir is cache).
-        
+
         original_filename = data.get("filename", req.image_id)
-        # Ensure it's safe? It was sanitized in processing.py.
-        
+
         return FileResponse(
-            path=temp_path, 
+            path=temp_path,
             filename=f"{original_filename}_detected.xlsx",
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )

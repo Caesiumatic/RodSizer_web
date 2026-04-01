@@ -292,6 +292,21 @@
         </div>
 
         <script>
+            // Session isolation
+            const SESSION_ID = localStorage.getItem('rodsizer_session_id') || (() => {
+                const id = crypto.randomUUID();
+                localStorage.setItem('rodsizer_session_id', id);
+                return id;
+            })();
+            // Auto-append session_id to all API fetch calls
+            const _nativeFetch = window.fetch.bind(window);
+            window.fetch = (url, opts) => {
+                if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
+                    url += (url.includes('?') ? '&' : '?') + 'session_id=' + SESSION_ID;
+                }
+                return _nativeFetch(url, opts);
+            };
+
             const urlParams = new URLSearchParams(window.location.search);
             const folderName = urlParams.get('folder');
 
@@ -305,7 +320,7 @@
             document.getElementById('backLink').innerText = `← Back to ${folderName}`;
 
             const dlBtn = document.getElementById('downloadAggExcel');
-            dlBtn.href = `/folders/${encodeURIComponent(folderName)}/export_aggregate`;
+            dlBtn.href = `/folders/${encodeURIComponent(folderName)}/export_aggregate?session_id=${SESSION_ID}`;
 
             let lengthChart, widthChart;
 

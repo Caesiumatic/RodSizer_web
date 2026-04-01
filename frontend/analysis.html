@@ -606,6 +606,21 @@
     </div>
 
     <script>
+        // Session isolation
+        const SESSION_ID = localStorage.getItem('rodsizer_session_id') || (() => {
+            const id = crypto.randomUUID();
+            localStorage.setItem('rodsizer_session_id', id);
+            return id;
+        })();
+        // Auto-append session_id to all API fetch calls
+        const _nativeFetch = window.fetch.bind(window);
+        window.fetch = (url, opts) => {
+            if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
+                url += (url.includes('?') ? '&' : '?') + 'session_id=' + SESSION_ID;
+            }
+            return _nativeFetch(url, opts);
+        };
+
         const urlParams = new URLSearchParams(window.location.search);
         const imageId = urlParams.get('id');
         const folderParam = urlParams.get('folder');
