@@ -814,7 +814,7 @@
                 syncParticleOverlayToImage();
                 renderParticleOverlay();
             };
-            image.src = `${nextUrl}?t=${timestamp}`;
+            image.src = `${nextUrl}?t=${timestamp}&session_id=${SESSION_ID}`;
         }
 
         function toggleImageView() {

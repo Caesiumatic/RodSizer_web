@@ -781,7 +781,7 @@
                     card.className = 'image-card';
 
                     // Paths
-                    let imgSrc = `/results/${img.id}_preview.jpg`;
+                    let imgSrc = `/results/${img.id}_preview.jpg?session_id=${SESSION_ID}`;
                     let onClick = `window.location.href = '/analysis?id=${img.id}&folder=${encodeURIComponent(currentFolder)}'`;
 
                     if (isProcessing) {
@@ -797,7 +797,7 @@
                         </div>
                     ` : '';
 
-                    const errorFallback = `this.onerror=null; this.src='/results/${img.id}_overlay.jpg';`;
+                    const errorFallback = `this.onerror=null; this.src='/results/${img.id}_overlay.jpg?session_id=${SESSION_ID}';`;
                     const cursorStyle = onClick ? 'cursor: pointer;' : 'cursor: default;';
 
                     card.innerHTML = `
