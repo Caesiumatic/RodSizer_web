@@ -1,0 +1,17 @@
+.DS_Store
+
+# Python environments
+.venv/
+venv/
+backend/.venv/
+backend/.venv_test/
+
+# Python cache
+__pycache__/
+*.py[cod]
+backend/.cache/
+
+# Local runtime artifacts
+*.log
+results/
+uploads/
