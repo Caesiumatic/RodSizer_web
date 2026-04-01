@@ -1,24 +1,24 @@
 FROM python:3.10-slim
 
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
 WORKDIR /app
 
 # Install system dependencies required by OpenCV and other packages
+USER root
 RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libgl1-mesa-glx \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+USER user
 
-# Install Python dependencies
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --chown=user backend/requirements.txt requirements.txt
+RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# Copy project files
-COPY backend/ ./backend/
-COPY frontend/ ./frontend/
-
-# HF Spaces runs as non-root user, /tmp is writable
-RUN mkdir -p /tmp/uploads /tmp/results
+COPY --chown=user . /app
 
 EXPOSE 7860
 
