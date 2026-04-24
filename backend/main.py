@@ -1,24 +1,36 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import shutil
 import os
 import uuid
-import glob
 import re
 import time
 import asyncio
 from pathlib import Path
 from typing import List
 from processing import process_image, generate_preview, save_results_to_excel, generate_binary_mask_preview
-from typing import Optional
 from pydantic import BaseModel
 import json
 from contextlib import asynccontextmanager
 
 SESSION_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 CLEANUP_INTERVAL_SECONDS = 60 * 60  # run every 1 hour
+
+# Upload limits (Hugging Face Spaces free tier has limited ephemeral storage).
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024   # 200 MB per file
+MAX_UPLOAD_FILES = 100                  # per request
+
+# Strict input patterns — these flow into filesystem paths, so we must not accept
+# separators, traversal tokens, or glob metacharacters.
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+# Roots for session storage. Resolving at import time lets us reject any path
+# that escapes them regardless of how components were joined.
+_UPLOAD_ROOT = Path("/tmp/uploads").resolve()
+_RESULTS_ROOT = Path("/tmp/results").resolve()
 
 def cleanup_old_sessions():
     """Delete session dirs in /tmp/uploads and /tmp/results not modified in >24h."""
@@ -70,16 +82,67 @@ RESULTS_SCHEMA_VERSION = 2
 FRONTEND_DIR.mkdir(exist_ok=True)
 
 
+def _validate_session_id(session_id: str) -> str:
+    """Reject anything that could escape the per-session directory.
+    Session IDs come from clients (JS generates them) so we must treat them as untrusted."""
+    if not session_id or not _SESSION_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id")
+    return session_id
+
+
+def _safe_session_dir(root: Path, session_id: str) -> Path:
+    _validate_session_id(session_id)
+    candidate = (root / session_id).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session id")
+    return candidate
+
+
 def get_upload_dir(session_id: str) -> Path:
-    d = Path("/tmp/uploads") / session_id
+    d = _safe_session_dir(_UPLOAD_ROOT, session_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def get_results_dir(session_id: str) -> Path:
-    d = Path("/tmp/results") / session_id
+    d = _safe_session_dir(_RESULTS_ROOT, session_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _safe_join(base: Path, *parts: str) -> Path:
+    """Join under `base` and ensure the result stays inside `base` after resolving.
+    Raises HTTPException(400) on traversal attempts or empty components."""
+    base_resolved = base.resolve()
+    candidate = base_resolved
+    for raw in parts:
+        if raw is None or raw == "":
+            raise HTTPException(status_code=400, detail="Invalid path component")
+        if "/" in raw or "\\" in raw or raw in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid path component")
+        candidate = candidate / raw
+
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(base_resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path escapes allowed directory")
+    return resolved
+
+
+def _validate_image_id(image_id: str) -> str:
+    if not image_id or not _UUID_RE.match(image_id):
+        raise HTTPException(status_code=400, detail="Invalid image id")
+    return image_id
+
+
+def _resolve_folder(upload_dir: Path, folder_name: str) -> Path:
+    safe = _sanitize_folder_name(folder_name)
+    if not safe:
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    return _safe_join(upload_dir, safe)
 
 
 def _cached_results_are_current(payload: dict, expected_binary_mask_tune: int = 0) -> bool:
@@ -111,10 +174,13 @@ def _sanitize_folder_name(folder_name: str) -> str:
 
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = cleaned.rstrip(". ")
+    if cleaned in ("", ".", ".."):
+        return ""
     return cleaned
 
 
 def _find_input_and_calibration_source(image_id: str, upload_dir: Path):
+    _validate_image_id(image_id)
     files = list(upload_dir.rglob(f"{image_id}.*"))
     if not files:
         raise HTTPException(status_code=404, detail="Image not found")
@@ -169,7 +235,7 @@ async def create_folder(folder_name: str = Form(...), session_id: str = Query(..
         if not safe_name:
              raise HTTPException(status_code=400, detail="Invalid folder name")
 
-        folder_path = upload_dir / safe_name
+        folder_path = _safe_join(upload_dir, safe_name)
         if folder_path.exists():
              raise HTTPException(status_code=400, detail="Folder already exists")
 
@@ -195,7 +261,7 @@ async def list_folders(session_id: str = Query(...)):
 async def rename_folder(folder_name: str, new_name: str = Form(...), session_id: str = Query(...)):
     try:
         upload_dir = get_upload_dir(session_id)
-        source_path = upload_dir / folder_name
+        source_path = _resolve_folder(upload_dir, folder_name)
         if not source_path.exists() or not source_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
 
@@ -206,7 +272,7 @@ async def rename_folder(folder_name: str, new_name: str = Form(...), session_id:
         if safe_name == folder_name:
             return {"status": "success", "folder": safe_name, "renamed": False}
 
-        target_path = upload_dir / safe_name
+        target_path = _safe_join(upload_dir, safe_name)
         if target_path.exists():
             raise HTTPException(status_code=400, detail="A folder with that name already exists")
 
@@ -221,7 +287,7 @@ async def rename_folder(folder_name: str, new_name: str = Form(...), session_id:
 async def delete_folder(folder_name: str, session_id: str = Query(...)):
     try:
         upload_dir = get_upload_dir(session_id)
-        folder_path = upload_dir / folder_name
+        folder_path = _resolve_folder(upload_dir, folder_name)
         if not folder_path.exists() or not folder_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
 
@@ -241,9 +307,10 @@ class FolderSelectionRequest(BaseModel):
 @app.post("/folders/{folder_name}/save_selection")
 async def save_folder_selection(folder_name: str, req: FolderSelectionRequest, session_id: str = Query(...)):
     try:
+        _validate_image_id(req.image_id)
         upload_dir = get_upload_dir(session_id)
         results_dir = get_results_dir(session_id)
-        folder_path = upload_dir / folder_name
+        folder_path = _resolve_folder(upload_dir, folder_name)
         if not folder_path.exists():
             raise HTTPException(status_code=404, detail="Folder not found")
 
@@ -285,7 +352,7 @@ async def save_folder_selection(folder_name: str, req: FolderSelectionRequest, s
 async def aggregate_folder(folder_name: str, session_id: str = Query(...)):
     try:
         upload_dir = get_upload_dir(session_id)
-        folder_path = upload_dir / folder_name
+        folder_path = _resolve_folder(upload_dir, folder_name)
         cache_dir = folder_path / ".analysis_cache"
 
         if not cache_dir.exists():
@@ -337,7 +404,8 @@ async def export_aggregate_folder(folder_name: str, session_id: str = Query(...)
     try:
         upload_dir = get_upload_dir(session_id)
         results_dir = get_results_dir(session_id)
-        folder_path = upload_dir / folder_name
+        folder_path = _resolve_folder(upload_dir, folder_name)
+        safe_folder_name = folder_path.name
         cache_dir = folder_path / ".analysis_cache"
 
         if not cache_dir.exists():
@@ -357,17 +425,19 @@ async def export_aggregate_folder(folder_name: str, session_id: str = Query(...)
         if not combined_data:
             raise HTTPException(status_code=400, detail="No data found")
 
-        temp_name = f"export_folder_{folder_name}_{uuid.uuid4().hex[:8]}.xlsx"
+        temp_name = f"export_folder_{safe_folder_name}_{uuid.uuid4().hex[:8]}.xlsx"
         temp_path = results_dir / temp_name
 
         save_results_to_excel(combined_data, temp_path)
 
         return FileResponse(
             path=temp_path,
-            filename=f"{folder_name}_analysis_report.xlsx",
+            filename=f"{safe_folder_name}_analysis_report.xlsx",
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Export Aggregate Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -380,22 +450,46 @@ async def upload_images(background_tasks: BackgroundTasks, folder: str = Form(No
     results_dir = get_results_dir(session_id)
     uploaded_files = []
     try:
+        if len(files) > MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=400, detail=f"Too many files (max {MAX_UPLOAD_FILES} per request)")
+
+        if folder:
+            save_dir = _resolve_folder(upload_dir, folder)
+            if not save_dir.exists():
+                raise HTTPException(status_code=400, detail="Folder does not exist")
+        else:
+            save_dir = upload_dir
+
         for file in files:
             file_id = str(uuid.uuid4())
-            safe_filename = Path(file.filename).name
+            raw_name = Path(file.filename or "").name
+            if not raw_name or raw_name in (".", ".."):
+                raise HTTPException(status_code=400, detail="Invalid filename")
+            safe_filename = _sanitize_folder_name(raw_name)
+            if not safe_filename:
+                raise HTTPException(status_code=400, detail="Invalid filename")
             save_name = f"{file_id}_{safe_filename}"
 
-            if folder:
-                save_dir = upload_dir / folder
-                if not save_dir.exists():
-                    raise HTTPException(status_code=400, detail="Folder does not exist")
-            else:
-                save_dir = upload_dir
+            file_path = _safe_join(save_dir, save_name)
 
-            file_path = save_dir / save_name
-
+            bytes_written = 0
             with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_UPLOAD_BYTES:
+                        buffer.close()
+                        try:
+                            file_path.unlink()
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File exceeds maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+                        )
+                    buffer.write(chunk)
 
             generate_preview(file_path, results_dir)
 
@@ -437,11 +531,15 @@ async def list_images(session_id: str = Query(...), folder: str = Query(None)):
     results_dir = get_results_dir(session_id)
     images = []
 
-    target_dir = upload_dir
     if folder:
-        target_dir = upload_dir / folder
+        try:
+            target_dir = _resolve_folder(upload_dir, folder)
+        except HTTPException:
+            return []
         if not target_dir.exists():
             return []
+    else:
+        target_dir = upload_dir
 
     for path in target_dir.glob("*"):
         if path.is_file() and path.suffix.lower() in ['.tif', '.tiff', '.jpg', '.jpeg', '.png', '.dm3', '.dm4', '.emd']:
@@ -465,6 +563,7 @@ async def list_images(session_id: str = Query(...), folder: str = Query(None)):
 @app.delete("/images/{image_id}")
 async def delete_image(image_id: str, session_id: str = Query(...)):
     try:
+        _validate_image_id(image_id)
         upload_dir = get_upload_dir(session_id)
         results_dir = get_results_dir(session_id)
         files = list(upload_dir.rglob(f"{image_id}.*"))
@@ -472,12 +571,24 @@ async def delete_image(image_id: str, session_id: str = Query(...)):
             raise HTTPException(status_code=404, detail="Image not found")
 
         for f in files:
-            os.remove(f)
+            resolved = f.resolve()
+            try:
+                resolved.relative_to(upload_dir)
+            except ValueError:
+                continue
+            os.remove(resolved)
 
         for res_file in results_dir.glob(f"{image_id}*"):
-            os.remove(res_file)
+            resolved = res_file.resolve()
+            try:
+                resolved.relative_to(results_dir)
+            except ValueError:
+                continue
+            os.remove(resolved)
 
         return {"status": "success", "message": "Image deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -544,24 +655,53 @@ async def process_binary_preview_endpoint(
 
 @app.get("/results/{filename}")
 async def get_result_file(filename: str, session_id: str = Query(...)):
+    if (
+        not filename
+        or filename in (".", "..")
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or any(ord(c) < 32 for c in filename)
+        or any(ch in filename for ch in "*?[]")
+    ):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     upload_dir = get_upload_dir(session_id)
     results_dir = get_results_dir(session_id)
-    file_path = results_dir / filename
-    if not file_path.exists():
-        file_path = upload_dir / filename
-        if not file_path.exists():
-            found = list(upload_dir.rglob(filename))
-            if found:
-                file_path = found[0]
-            else:
-                raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+
+    results_candidate = (results_dir / filename).resolve()
+    try:
+        results_candidate.relative_to(results_dir)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if results_candidate.is_file():
+        return FileResponse(results_candidate)
+
+    uploads_candidate = (upload_dir / filename).resolve()
+    try:
+        uploads_candidate.relative_to(upload_dir)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if uploads_candidate.is_file():
+        return FileResponse(uploads_candidate)
+
+    for found in upload_dir.rglob(filename):
+        resolved = found.resolve()
+        try:
+            resolved.relative_to(upload_dir)
+        except ValueError:
+            continue
+        if resolved.is_file() and resolved.name == filename:
+            return FileResponse(resolved)
+
+    raise HTTPException(status_code=404, detail="File not found")
 
 # --- Export ---
 
 @app.post("/export")
 async def export_data(req: ExportRequest, session_id: str = Query(...)):
     try:
+        _validate_image_id(req.image_id)
         results_dir = get_results_dir(session_id)
         json_path = results_dir / f"{req.image_id}_results.json"
         if not json_path.exists():
@@ -581,14 +721,19 @@ async def export_data(req: ExportRequest, session_id: str = Query(...)):
 
         save_results_to_excel(filtered_results, temp_path)
 
-        original_filename = data.get("filename", req.image_id)
+        # Sanitize the suggested download filename — it originates from the
+        # uploaded filename and flows into a response header.
+        raw_name = data.get("filename") or req.image_id
+        safe_download_stem = _sanitize_folder_name(Path(raw_name).stem) or req.image_id
 
         return FileResponse(
             path=temp_path,
-            filename=f"{original_filename}_detected.xlsx",
+            filename=f"{safe_download_stem}_detected.xlsx",
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Export Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
