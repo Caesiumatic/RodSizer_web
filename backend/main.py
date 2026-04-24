@@ -25,6 +25,10 @@ MAX_UPLOAD_FILES = 100                  # per request
 # Strict input patterns — these flow into filesystem paths, so we must not accept
 # separators, traversal tokens, or glob metacharacters.
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Image IDs are the stem of uploaded files, formatted as "<uuid>" or "<uuid>_<sanitized_name>".
+_IMAGE_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:_.+)?$"
+)
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 # Roots for session storage. Resolving at import time lets us reject any path
@@ -133,8 +137,11 @@ def _safe_join(base: Path, *parts: str) -> Path:
 
 
 def _validate_image_id(image_id: str) -> str:
-    if not image_id or not _UUID_RE.match(image_id):
+    if not image_id or not _IMAGE_ID_RE.match(image_id):
         raise HTTPException(status_code=400, detail="Invalid image id")
+    for c in image_id:
+        if ord(c) < 32 or c in '/\\*?[]':
+            raise HTTPException(status_code=400, detail="Invalid image id")
     return image_id
 
 
@@ -181,7 +188,7 @@ def _sanitize_folder_name(folder_name: str) -> str:
 
 def _find_input_and_calibration_source(image_id: str, upload_dir: Path):
     _validate_image_id(image_id)
-    files = list(upload_dir.rglob(f"{image_id}.*"))
+    files = [p for p in upload_dir.rglob("*") if p.is_file() and p.stem == image_id]
     if not files:
         raise HTTPException(status_code=404, detail="Image not found")
 
@@ -566,7 +573,7 @@ async def delete_image(image_id: str, session_id: str = Query(...)):
         _validate_image_id(image_id)
         upload_dir = get_upload_dir(session_id)
         results_dir = get_results_dir(session_id)
-        files = list(upload_dir.rglob(f"{image_id}.*"))
+        files = [p for p in upload_dir.rglob("*") if p.is_file() and p.stem == image_id]
         if not files:
             raise HTTPException(status_code=404, detail="Image not found")
 
@@ -578,7 +585,9 @@ async def delete_image(image_id: str, session_id: str = Query(...)):
                 continue
             os.remove(resolved)
 
-        for res_file in results_dir.glob(f"{image_id}*"):
+        for res_file in results_dir.iterdir():
+            if not res_file.is_file() or not res_file.name.startswith(image_id):
+                continue
             resolved = res_file.resolve()
             try:
                 resolved.relative_to(results_dir)
