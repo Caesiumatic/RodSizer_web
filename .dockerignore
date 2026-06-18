@@ -1,0 +1,25 @@
+# Keep the image small and the build context clean.
+.git
+.gitattributes
+.gitignore
+.dockerignore
+.claude
+.DS_Store
+**/.DS_Store
+**/__pycache__
+*.pyc
+*.log
+backend/.venv
+backend/.venv_test
+backend/.cache
+
+# Local runtime data — the Space uses ephemeral /tmp per session.
+results/
+uploads/
+
+# Desktop launchers / scripts are not used in the container.
+RodSizer_Launcher_MacOS.command
+RodSizer_Launcher_Windows.bat
+RodSizer_DEBUG_Windows.bat
+RodSizer_CLEANER_MacOS.command
+backend/start_server.sh

@@ -6,12 +6,15 @@ ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /app
 
-# Install system dependencies required by OpenCV and other packages
+# System dependencies: OpenCV runtime libs + Tesseract OCR (used to read the
+# burned-in scale bar / "Pixel size" footer of camera exports that have no
+# embedded calibration metadata).
 USER root
 RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libgl1 \
     libgomp1 \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 USER user
 
