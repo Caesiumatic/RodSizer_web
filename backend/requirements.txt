@@ -5,11 +5,9 @@ numpy
 opencv-python-headless
 scikit-image
 ncempy
-matplotlib
 pandas
 Pillow
+pytesseract
 tifffile
-stardist
-tensorflow
 openpyxl
 h5py

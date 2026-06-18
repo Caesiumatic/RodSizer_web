@@ -81,9 +81,17 @@ app.add_middleware(
 # Base directories (session subdirs are created on demand)
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
-RESULTS_SCHEMA_VERSION = 2
+RESULTS_SCHEMA_VERSION = 6
 
 FRONTEND_DIR.mkdir(exist_ok=True)
+
+# The frontend HTML is updated often; tell the browser to always revalidate so a
+# deploy is never hidden behind a stale cached page.
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
+
+def _frontend_page(name: str) -> FileResponse:
+    return FileResponse(FRONTEND_DIR / name, headers=_NO_CACHE_HEADERS)
 
 
 def _validate_session_id(session_id: str) -> str:
@@ -222,15 +230,15 @@ app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 @app.get("/")
 async def read_index():
-    return FileResponse(FRONTEND_DIR / "index.html")
+    return _frontend_page("index.html")
 
 @app.get("/analysis")
 async def read_analysis():
-    return FileResponse(FRONTEND_DIR / "analysis.html")
+    return _frontend_page("analysis.html")
 
 @app.get("/folder_analysis")
 async def read_folder_analysis():
-    return FileResponse(FRONTEND_DIR / "folder_analysis.html")
+    return _frontend_page("folder_analysis.html")
 
 # --- Folder Management ---
 

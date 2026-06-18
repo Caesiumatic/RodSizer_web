@@ -1,9 +1,136 @@
 import numpy as np
 import cv2
-import numpy as np
-import cv2
-from skimage import io, color, util, morphology, measure, filters, exposure, segmentation
+from skimage import color, util, morphology, measure, exposure
+from skimage.segmentation import watershed
 from scipy import ndimage as ndi
+
+
+def _remove_small_objects(binary, min_size):
+    try:
+        return morphology.remove_small_objects(binary, max_size=min_size)
+    except TypeError:
+        return morphology.remove_small_objects(binary, min_size=min_size)
+
+
+def _remove_small_holes(binary, max_hole_size):
+    try:
+        return morphology.remove_small_holes(binary, max_size=max_hole_size)
+    except TypeError:
+        return morphology.remove_small_holes(binary, area_threshold=max_hole_size)
+
+
+def _detect_footer_top(image):
+    """Return the first row of a bottom microscope footer, or image height."""
+    h, w = image.shape[:2]
+    if h < 200 or w < 200:
+        return h
+
+    row_mean = image.mean(axis=1)
+    row_std = image.std(axis=1)
+    row_bright = (image > 190).mean(axis=1)
+
+    body_end = max(1, int(h * 0.75))
+    body_mean = float(np.median(row_mean[:body_end]))
+    body_std = float(np.median(row_std[:body_end]))
+    body_bright = float(np.median(row_bright[:body_end]))
+
+    footer_like = (
+        ((row_mean < body_mean - 10) & (row_std < body_std + 5))
+        | (row_bright > body_bright + 0.12)
+        | (row_std > body_std + 22)
+    )
+
+    window = int(np.clip(h // 180, 15, 45))
+    smooth = np.convolve(footer_like.astype(float), np.ones(window) / window, mode="same")
+    rows = np.arange(h)
+    candidates = np.flatnonzero((rows >= int(h * 0.82)) & (smooth > 0.35))
+    if candidates.size == 0:
+        return h
+
+    footer_top = int(candidates[0])
+    footer_height = h - footer_top
+    if footer_height < max(30, int(h * 0.01)) or footer_height > int(h * 0.18):
+        return h
+    return footer_top
+
+
+def _border_ratio(binary, valid_height):
+    h, w = binary.shape[:2]
+    valid_height = int(np.clip(valid_height, 1, h))
+    y_bottom = valid_height - 1
+    if valid_height == 1:
+        values = binary[0, :]
+    else:
+        values = np.concatenate([
+            binary[0, :],
+            binary[y_bottom, :],
+            binary[1:y_bottom, 0],
+            binary[1:y_bottom, w - 1],
+        ])
+    return float(values.mean()) if values.size else 0.0
+
+
+def _postprocess_candidate(raw_binary, footer_top, closing_radius, opening_radius):
+    binary = raw_binary.astype(bool, copy=True)
+    if footer_top < binary.shape[0]:
+        binary[footer_top:, :] = False
+
+    binary = _remove_small_objects(binary, 500)
+
+    if closing_radius > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (closing_radius * 2 + 1, closing_radius * 2 + 1),
+        )
+        binary = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+    if opening_radius > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (opening_radius * 2 + 1, opening_radius * 2 + 1),
+        )
+        binary = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
+
+    if footer_top < binary.shape[0]:
+        binary[footer_top:, :] = False
+
+    max_hole_size = int(np.clip(binary.size // 2000, 256, 10000))
+    binary = _remove_small_holes(binary, max_hole_size)
+
+    if footer_top < binary.shape[0]:
+        binary[footer_top:, :] = False
+
+    return binary
+
+
+def _score_candidate(binary, valid_height):
+    h, w = binary.shape[:2]
+    valid_height = int(np.clip(valid_height, 1, h))
+    valid_binary = binary[:valid_height, :]
+    valid_pixels = max(1, valid_binary.size)
+    foreground_ratio = float(valid_binary.sum()) / valid_pixels
+
+    if foreground_ratio <= 0:
+        return float("inf")
+
+    labeled, _ = ndi.label(valid_binary)
+    sizes = np.bincount(labeled.ravel())
+    component_sizes = sizes[1:]
+    component_count = len(component_sizes)
+    largest_ratio = (float(component_sizes.max()) / valid_pixels) if component_count else 0.0
+    border = _border_ratio(binary, valid_height)
+
+    score = abs(foreground_ratio - 0.16)
+    score += largest_ratio * 2.5
+    score += border * 0.75
+    expected_component_limit = max(50.0, valid_pixels / 10000.0)
+    if component_count > expected_component_limit:
+        score += ((component_count - expected_component_limit) / expected_component_limit) * 0.75
+    if foreground_ratio > 0.50:
+        score += (foreground_ratio - 0.50) * 4.0
+    if foreground_ratio < 0.002:
+        score += (0.002 - foreground_ratio) * 20.0
+    return score
+
 
 def image_kmeans(image, k=2, separation_strength=0):
     """
@@ -11,71 +138,67 @@ def image_kmeans(image, k=2, separation_strength=0):
     Matches MATLAB 'imagekmeans.m' and 'loadEMimages.m' logic.
     """
     # 1. Preprocessing — Contrast Stretching
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
     p1, p99 = np.percentile(image, (1, 99))
+    if p99 <= p1:
+        return np.zeros(image.shape[:2], dtype=np.uint8)
+
     image_adj = exposure.rescale_intensity(image, in_range=(p1, p99), out_range=np.uint8)
+    image_adj = cv2.medianBlur(image_adj, 3)
 
     # 2. K-means clustering (k=2: foreground vs background)
-    data = image_adj.reshape((-1, 1)).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    flags = cv2.KMEANS_RANDOM_CENTERS
-    compactness, labels, centers = cv2.kmeans(data, k, None, criteria, 10, flags)
-    segmented_image = labels.reshape(image.shape)
+    # Use a deterministic sample for large camera JPGs, then apply centers to full image.
+    k = max(2, int(k))
+    max_kmeans_pixels = 750_000
+    step = max(1, int(np.ceil(np.sqrt(image_adj.size / max_kmeans_pixels))))
+    data = image_adj[::step, ::step].reshape((-1, 1)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+    cv2.setRNGSeed(0)
+    _, _, centers = cv2.kmeans(data, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    centers = centers.reshape(-1)
 
-    # 3. Foreground Selection — border-pixel voting
-    # Border pixels are almost always background in microscopy images.
-    # The cluster that dominates the border is background; the other is foreground.
-    # This works for BOTH black-bg (bright particles) and white-bg (dark particles).
+    if k == 2:
+        threshold = float(np.mean(centers))
+        if centers[0] <= centers[1]:
+            segmented_image = np.where(image_adj <= threshold, 0, 1)
+        else:
+            segmented_image = np.where(image_adj <= threshold, 1, 0)
+    else:
+        distances = np.abs(image_adj.astype(np.float32)[..., None] - centers[None, None, :])
+        segmented_image = np.argmin(distances, axis=2)
+
+    # 3. Foreground selection. Border voting alone breaks on exported camera JPGs
+    # with bottom metadata strips, so score each class after light morphology.
     h, w = image_adj.shape[:2]
-    border_labels = np.concatenate([
-        segmented_image[0, :],        # top row
-        segmented_image[h-1, :],      # bottom row
-        segmented_image[1:h-1, 0],    # left column
-        segmented_image[1:h-1, w-1]   # right column
-    ])
-    # Majority vote: which cluster appears more on the border?
-    bg_cluster = int(np.round(np.mean(border_labels)))
-    fg_cluster = 1 - bg_cluster
+    footer_top = _detect_footer_top(image_adj)
 
-    binary = (segmented_image == fg_cluster)
-
-    # 4. Post-processing (Morphology chain from imagekmeans.m)
-    # NOTE: Border objects are filtered per-particle in processing.py, not here
-    # BW_fill_filter = imfill(BW,4,'holes');
-    binary = ndi.binary_fill_holes(binary)
-    
-    # BW_fill_filter = bwareafilt(BW_fill_filter, [500 5000000]);
-    # Remove small objects (noise)
-    binary = morphology.remove_small_objects(binary, min_size=500)
-    
-    # BW_fill_filter = bwmorph(BW_fill_filter,'spur'); -> Skip (minor)
-    # BW_fill_filter = bwmorph(BW_fill_filter,'majority');
-    # Majority: pixel is white if >=5 of 3x3 neighbors are white
-    # We can use rank filter or just skip if subtle. 
-    # Let's Skip majority to avoid rounding corners too much.
-    
-    # Allow a user-controlled separation/merge bias.
-    # Positive values favor splitting lightly connected regions.
-    # Negative values favor keeping nearby regions connected.
-    # Use a nonlinear radius map so upper slider values feel meaningfully stronger.
     separation_strength = int(np.clip(separation_strength, -6, 6))
-    radius_by_strength = [1, 3, 6, 9, 13, 17, 22]
-    closing_radius = radius_by_strength[max(0, -separation_strength)]
-    opening_radius = radius_by_strength[max(0, separation_strength)]
+    merge_closing_radius = [1, 3, 5, 7, 9, 11, 13]
+    split_opening_radius = [3, 4, 5, 6, 7, 8, 9]
+    if separation_strength < 0:
+        closing_radius = merge_closing_radius[-separation_strength]
+        opening_radius = 1
+    else:
+        closing_radius = 1
+        opening_radius = split_opening_radius[separation_strength]
 
-    # BW_fill_filter = bwmorph(BW_fill_filter,'close');
-    binary = morphology.binary_closing(binary, morphology.disk(closing_radius))
-    
-    # BW_fill_filter = bwmorph(BW_fill_filter,'bridge'); 
-    # Bridge unconnected pixels. Closing roughly does this.
-    
-    # BW_fill_filter = bwmorph(BW_fill_filter,'open');
-    binary = morphology.binary_opening(binary, morphology.disk(opening_radius))
-    
-    # BW_fill_filter = imfill(BW_fill_filter,4,'holes');
-    binary = ndi.binary_fill_holes(binary)
-    
-    # BW_fill_filter = imfilter(..., gaussian) -> Skipped as it returns float, we need binary.
-    
+    best_binary = None
+    best_score = float("inf")
+    for label_idx in range(k):
+        candidate = _postprocess_candidate(
+            segmented_image == label_idx,
+            footer_top,
+            closing_radius,
+            opening_radius,
+        )
+        score = _score_candidate(candidate, footer_top)
+        if score < best_score:
+            best_score = score
+            best_binary = candidate
+
+    binary = best_binary if best_binary is not None else np.zeros((h, w), dtype=bool)
     return binary.astype(np.uint8)
 
 def compute_hu_moments(image):
@@ -298,12 +421,92 @@ def dilmarkers(markers, original_shape):
                 se = se2
                 
             # Keep dilation constrained to the image size (it is same size masks)
-            dilated = morphology.binary_dilation(dilated, se)
+            dilated = morphology.dilation(dilated, se)
             
         dilated_markers.append(dilated)
         
     # We mainly need the dilated markers list
     # Constructing overlay omitted for speed unless needed, but returning dummy if needed
     # The user code might check return tuple.
-    
+
     return dilated_markers, bg_image # returning image as overlay placeholder
+
+
+def split_clump(crop_bool, min_marker_area, separation_strength=0):
+    """
+    Split a fused / low-solidity binary region into individual convex particles
+    using a marker-controlled watershed on the Euclidean distance transform.
+
+    This is the primary clump separator. Compared with recursive erosion
+    (``ruecs``) it is far faster (the heavy steps are C-implemented) and more
+    robust on dense nanorod aggregates, because seeds are extended (h-) maxima of
+    the distance map: the whole ridge of one elongated rod collapses to a single
+    regional maximum, so a single rod is NOT cut into pieces, while two touching
+    rods separated by a neck become two seeds.
+
+    Args:
+        crop_bool: 2-D boolean array — one connected component (the clump).
+        min_marker_area: discard watershed basins smaller than this (px).
+        separation_strength: -6..+6. Higher = split more aggressively
+            (more seeds); lower = merge more. 0 is the balanced default.
+
+    Returns:
+        List of 2-D boolean masks (same shape as ``crop_bool``), one per
+        particle. Returns ``[crop_bool]`` when the region should stay whole.
+    """
+    crop_bool = np.ascontiguousarray(crop_bool, dtype=bool)
+    if not crop_bool.any():
+        return []
+
+    # Bound worst-case cost: a binarisation failure can flood into one giant
+    # region, where the distance transform / morphological reconstruction /
+    # watershed would otherwise take many seconds. For oversized regions we run
+    # the split on a downscaled copy and map the labels back. Normal particles
+    # and clumps are far below this budget, so their results are unchanged.
+    max_work_px = 4_000_000
+    scale = 1
+    work = crop_bool
+    if crop_bool.size > max_work_px:
+        scale = int(np.ceil(np.sqrt(crop_bool.size / max_work_px)))
+        downscaled = crop_bool[::scale, ::scale]
+        if downscaled.any():
+            work = np.ascontiguousarray(downscaled)
+        else:
+            scale = 1
+
+    dist = ndi.distance_transform_edt(work)
+    # Light smoothing suppresses spurious ridge bumps that would over-segment.
+    dist = ndi.gaussian_filter(dist, 1.0)
+
+    peak = float(dist.max())
+    # Region too thin to contain more than one particle core — keep as-is.
+    if peak < 1.5:
+        return [crop_bool]
+
+    # h controls how deep a valley between two cores must be before they are
+    # treated as separate seeds. Tie it to the user's separation slider so the
+    # same control that tunes binarisation also tunes clump splitting.
+    separation_strength = int(np.clip(separation_strength, -6, 6))
+    h_frac = float(np.clip(0.45 - separation_strength * 0.04, 0.18, 0.72))
+    h = max(0.75, peak * h_frac)
+
+    markers, n = ndi.label(morphology.h_maxima(dist, h))
+    if n <= 1:
+        return [crop_bool]
+
+    ws = watershed(-dist, markers, mask=work)
+
+    if scale > 1:
+        # Upsample the label map back to full resolution and re-constrain it to
+        # the exact original mask.
+        ws = np.repeat(np.repeat(ws, scale, axis=0), scale, axis=1)
+        ws = ws[:crop_bool.shape[0], :crop_bool.shape[1]]
+        ws = ws * crop_bool
+
+    masks = []
+    for label_idx in range(1, n + 1):
+        mask = ws == label_idx
+        if int(mask.sum()) >= min_marker_area:
+            masks.append(mask)
+
+    return masks or [crop_bool]
