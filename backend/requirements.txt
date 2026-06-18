@@ -1,3 +1,8 @@
+# NOTE: tensorflow + stardist are intentionally NOT listed here. They are unused
+# by the detection pipeline (K-means + watershed) and dominate the Hugging Face
+# Docker build time and image size (~1 GB+). Do not re-add them unless StarDist
+# detection is actually wired in. (The local RodSizer repo keeps them for that
+# possible future use.)
 fastapi
 uvicorn
 python-multipart
